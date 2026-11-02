@@ -1,0 +1,27 @@
+# Credentials: copy .env.example to .env and fill it in.
+.env
+
+# Data: raw exports, the sender CSV and its backups, locks and error summary.
+# Only the empty folder structure is versioned.
+csv/**
+!csv/**/
+!csv/**/.gitkeep
+json_payloads/*
+!json_payloads/.gitkeep
+
+# Safety net for data files saved anywhere else in the project.
+*.csv
+*.bak
+*.lock
+*.tar.xz
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Editors and OS
+.vscode/
+.idea/
+.zed/
+.DS_Store
