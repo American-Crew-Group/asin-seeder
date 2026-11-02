@@ -22,7 +22,7 @@ First time? Do the [Setup](#setup) below.
 ### 1. Load new ASINs
 
 ```bash
-cp ~/Downloads/new_export.csv csv/raw/    # any *.csv with an asin column (and optionally priority)
+cp ~/Downloads/new_export.csv csv/raw/    # see Raw export format below
 python3 convert_asins.py --dry-run        # shows added / queued again per file; writes nothing
 python3 convert_asins.py                  # merges into csv/formatted/asins.csv
 ```
@@ -106,7 +106,31 @@ cp .env.example .env    # then fill in the values
 
 Run commands from the project folder. `--csv` paths are relative to the current directory; the defaults of `convert_asins.py` and `build_payload.py` are relative to the scripts' folder.
 
+## Raw export format
+
+Files dropped in `csv/raw/` for `convert_asins.py`:
+
+```csv
+asin,priority
+B0CW9QHKRT,1
+B001F0R6EW,
+B07D3KJBVY,2
+```
+
+| Column | Values |
+| --- | --- |
+| `asin` | Required. If the file has a single column with another name (for example `stdValue`), that column is used. |
+| `priority` | Optional integer. Empty or missing column means `--default-priority` (999). |
+
+- The first line must be the header; without one the first ASIN is taken as the column name.
+- Other columns are ignored when `asin` is present. UTF-8, with or without BOM.
+- An empty ASIN, a non-integer priority or a malformed row rejects the whole file; nothing is merged.
+- An ASIN repeated in the same file takes the priority of its last row.
+- Every ASIN in the file is a new request to scrape it, so an ASIN already in `asins.csv` gets the file's priority (999 if the file has none, even if it had 1 before) and its `reason` is cleared, including reasons set by hand to exclude it.
+
 ## CSV format
+
+`csv/formatted/asins.csv` is maintained by the scripts: `convert_asins.py` adds and requeues rows, `send_asins.py` records results. Edit it by hand only to exclude, retry or fix a row (`reason`, or the `asin` value per [Valid ASIN values](#valid-asin-values)), after making a copy and with no script running.
 
 ```csv
 asin,sent,reason,priority,defer_variations,scrape_kind
