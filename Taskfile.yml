@@ -1,0 +1,65 @@
+# Commands for this project; run `task` to list them. https://taskfile.dev
+# Server tasks read deploy.prod.yml; use another file with: task status CONFIG=deploy.staging.yml
+version: '3'
+
+vars:
+  CONFIG: deploy.prod.yml
+
+env:
+  CONFIG: '{{.CONFIG}}'
+
+tasks:
+  default:
+    cmds:
+      - task --list
+    silent: true
+
+  test:
+    desc: Run the unit tests
+    cmds:
+      - python3 -m unittest
+
+  deploy:
+    desc: Test, upload the code with scp, restart the service and verify it is running (never touches the data)
+    deps: [test]
+    cmds:
+      - deploy/prod.sh deploy
+
+  status:
+    desc: Service state, CSV progress, top errors and last log lines (fails if the service is not running)
+    cmds:
+      - deploy/prod.sh status
+
+  stop:
+    desc: Stop the service (the batch in flight stays pending)
+    cmds:
+      - deploy/prod.sh stop
+
+  start:
+    desc: Start the service and verify it is running
+    cmds:
+      - deploy/prod.sh start
+
+  logs:
+    desc: Follow the service log
+    interactive: true
+    cmds:
+      - deploy/prod.sh logs
+
+  migrate-data:
+    desc: One time only - move the data on the server from migrate_from into remote_dir (copied and hash-checked there)
+    prompt: Move the server's data from migrate_from into remote_dir and rename the old asins.csv to asins.csv.migrated?
+    cmds:
+      - deploy/prod.sh migrate-data
+
+  init-data:
+    desc: One time only - upload the local asins.csv and processed.json to a new server that has none
+    prompt: Upload the local csv/formatted/asins.csv as the server's source of truth? (refused if it already has one)
+    cmds:
+      - deploy/prod.sh init-data
+
+  upload-env:
+    desc: Upload the local .env (API credentials), replacing the server's
+    prompt: Replace the server's .env with the local one?
+    cmds:
+      - deploy/prod.sh upload-env

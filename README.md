@@ -9,6 +9,8 @@ Merge raw ASIN exports into one CSV and submit its pending ASINs to the seeding 
 | `build_payload.py` | Write the next request body to `json_payloads/` without sending it. |
 | `deduplicate_asins.py` | Remove duplicate ASIN rows from a CSV. |
 
+In production the sender runs as a systemd service that merges new raw exports and sends by itself; see [Production server](#production-server). `Taskfile.yml`, `deploy.prod.yml` and `deploy/` deploy and operate it.
+
 ```text
 raw export ──► csv/raw/ ──convert_asins.py──► csv/formatted/asins.csv ──send_asins.py──► seeding API
                                                  (queue: sent, reason,          │
@@ -17,7 +19,7 @@ raw export ──► csv/raw/ ──convert_asins.py──► csv/formatted/asin
 
 ## Workflow
 
-First time? Do the [Setup](#setup) below.
+First time? Do the [Setup](#setup) below. These steps run the scripts by hand; on the production server the service does steps 1 and 3 by itself.
 
 ### 1. Load new ASINs
 
@@ -63,9 +65,105 @@ Under the hood, `send_asins.py`:
 
 Rerun the same command to resume: only rows still pending are sent, most important first. To retry a failed row, fix the cause, clear its `reason` and rerun.
 
+### 4. Or run it as a service
+
+On a server, `--watch` keeps the sender running instead of exiting:
+
+```bash
+python3 send_asins.py --csv csv/formatted/asins.csv --watch --batch-size 100
+```
+
+- **New raw files are merged automatically.** Between batches, and every `--poll-interval` seconds (30) while nothing is pending, it merges new files in `csv/raw/` exactly like `convert_asins.py` and recomputes the order, so a priority 1 ASIN goes out within one batch. Do not run `convert_asins.py` yourself meanwhile; it would refuse because the sender holds the lock.
+- **Files still being copied are skipped:** a file modified in the last 10 seconds waits for the next check.
+- **An invalid raw file is skipped,** reported once in the log, and never recorded in `processed.json`; the other files are still merged. Fix it and copy it again.
+- **API outages do not fail rows.** A whole-batch failure (HTTP error, network error, timeout, unrecognized response) leaves the batch pending and retries it after 1, 2, 4 … minutes, up to 1 hour, so a long outage costs nothing to clean up. Per-ASIN results such as `invalid` are recorded as usual. `--max-consecutive-failures` does not apply.
+- **Stopping** (Ctrl+C, `kill`, `systemctl stop`) never marks rows `UNKNOWN`: a batch in flight stays pending and is sent again; the API answers `duplicate` if it had already arrived.
+- New ASINs get priority 999 when the file has none and `defer_variations=false`, as with `convert_asins.py`'s defaults.
+- It never exits on its own: exit `130` after a stop, `2` on errors a person must fix (invalid `asins.csv`, missing credentials).
+
+To run it on the production server, use the deploy tasks below rather than starting it by hand.
+
+## Production server
+
+The service runs on the server described in `deploy.prod.yml`. [Task](https://taskfile.dev) runs every command from your machine over SSH; install it once (`sudo snap install task --classic` or `brew install go-task`) and run `task` to list them. Without Task, run `deploy/prod.sh <command>` instead.
+
+### Commands
+
+| Command | What it does |
+| --- | --- |
+| `task deploy` | Runs the tests, copies the code with `scp`, stops the service, installs the code and the systemd unit, checks that the data was not touched, starts the service and verifies that it read the CSV and stays up. |
+| `task status` | Service state, deployed revision, CSV progress (sent, pending, failed, unknown), top errors and the last log lines. Exits with an error if the service is not running. |
+| `task stop` / `task start` | Stop the service (the batch in flight stays pending) or start it and verify it. It stays enabled, so it also starts on boot. |
+| `task logs` | Follow the log. |
+| `task upload-env` | Copy the local `.env` (API credentials, both values required) to the server; asks first. |
+| `task migrate-data` | One time only: move the data on the server from `migrate_from` into `remote_dir`. Copied and hash-checked on the server; the old `asins.csv` and `processed.json` are renamed to `*.migrated` so nothing keeps sending from them. Builds `.env` from the old `.env` or the `export` lines in `~/.bashrc`. Asks first. |
+| `task init-data` | One time only, for a new server: copy the local `asins.csv` and `processed.json`. Asks first; refuses if the server already has data in `remote_dir` or `migrate_from`, because the server's copy is ahead of any local one. |
+| `task test` | Run the unit tests. |
+
+- **First deploy on the current server** (data still in `/home/ubuntu/asin-seeder`): `task migrate-data`, `task deploy`, `task status`.
+- **New, empty server:** `task upload-env`, `task init-data`, `task deploy`.
+- **Later deploys:** `task deploy`. It deploys the working tree and warns about uncommitted changes.
+
+`CONFIG=deploy.other.yml task status` uses another config file.
+
+### `deploy.prod.yml`
+
+Flat `key: value` lines; every key is required.
+
+| Key | Value |
+| --- | --- |
+| `host`, `ssh_port`, `ssh_user` | Server and SSH login. The user needs passwordless `sudo`. |
+| `ssh_key` | Private key (`~` allowed). |
+| `remote_dir` | Install folder (`/opt/asin-seeder`). |
+| `service_name`, `service_user` | systemd unit and the system user that runs it and owns the data (`asin-seeder`). |
+| `batch_size`, `interval` | `--batch-size` and `--interval` of the service. |
+| `migrate_from` | Folder used before the service (`/home/ubuntu/asin-seeder`), for `migrate-data`; `init-data` refuses while it holds an `asins.csv`. |
+
+### Data protection
+
+The server's data is the source of truth: `csv/formatted/asins.csv` (with its `.bak`, `.lock` and `.errors.csv`) records what was sent, and `csv/raw/processed.json` which raw files were merged.
+
+- **Deploys never copy, replace or delete it.** `task deploy` records the inode, size and hash of `asins.csv` and `processed.json` after stopping the service and does not start it again if they changed. It also refuses to deploy while another process, such as a `send_asins.py` started by hand, holds the CSV lock.
+- **People cannot change it.** It belongs to the `asin-seeder` user. The SSH user can read it but cannot edit or delete it, and the service can write only `csv/` and `json_payloads/`, not its own code.
+- **A deliberate manual fix** (see [Valid ASIN values](#valid-asin-values)): `task stop`, then copy and edit with `sudo -u asin-seeder`, then `task start`. Root can always bypass these permissions.
+
+| Path on the server | Owner and mode |
+| --- | --- |
+| `remote_dir/*.py`, `README.md`, `REVISION` (deployed commit) | root, read-only for everyone else |
+| `remote_dir/.env` | root only (`0600`); systemd reads it before starting the service |
+| `csv/formatted/` | `asin-seeder`; others read only |
+| `csv/raw/` | `asin-seeder` group can add files; sticky, so nobody removes `processed.json` or another user's files |
+| `/etc/systemd/system/asin-seeder.service` | Rendered from [`deploy/asin-seeder.service`](deploy/asin-seeder.service) |
+
+[`deploy/prod.sh`](deploy/prod.sh) runs on your machine and pipes [`deploy/server.sh`](deploy/server.sh) to the server, where it runs as root.
+
+### Loading new ASINs
+
+Copy the export into `csv/raw/` on the server; once it is 10 seconds old, the service merges it before its next batch, or within 30 seconds when nothing is pending. The SSH user can write there because it is in the `asin-seeder` group (log in again after the first deploy). Copy under another extension and rename it, so a half-copied file is never read:
+
+```bash
+scp -i ~/.ssh/pem/KP-MNM-Ubuntu.pem new.csv ubuntu@172.20.22.232:/opt/asin-seeder/csv/raw/new.csv.part
+ssh -i ~/.ssh/pem/KP-MNM-Ubuntu.pem ubuntu@172.20.22.232 \
+  mv /opt/asin-seeder/csv/raw/new.csv.part /opt/asin-seeder/csv/raw/new.csv
+```
+
+`rsync` already writes to a temporary name. Check the result with `task status` or `task logs`.
+
+### On the server
+
+| Task | Command |
+| --- | --- |
+| State and last log lines | `systemctl status asin-seeder` |
+| Follow the log | `journalctl -u asin-seeder -f` |
+| Today's log | `journalctl -u asin-seeder --since today` |
+| Only problems (skipped files, failed batches, errors) | `journalctl -u asin-seeder \| grep -E 'Batch failed\|Skipped raw\|Error\|x '` |
+| Stop / start | `sudo systemctl stop asin-seeder` / `sudo systemctl start asin-seeder` |
+
+After an error a person must fix, systemd restarts the service every 10 minutes and it logs the same error until fixed.
+
 ## Setup
 
-**Requirements:** Python 3 (tested with 3.14) on Linux or macOS.
+**Requirements:** Python 3 (tested with 3.14) on Linux or macOS. Deploying also needs [Task](https://taskfile.dev), `ssh` and `scp`.
 
 ```bash
 git clone <repository-url> asin-seeder
@@ -86,7 +184,7 @@ cp .env.example .env    # then fill in the values
    set -a; source .env; set +a
    ```
 
-   Quote values that contain spaces (`AUTHENDPOINT="Bearer abc..."`). `.env` is git-ignored.
+   Quote values that contain spaces (`AUTHENDPOINT="Bearer abc..."`). `.env` is git-ignored. On the server, systemd loads `remote_dir/.env` for the service.
 
 2. **Folders.** Included in the repository (empty). Their contents are data and are git-ignored, so the CSVs, backups and payloads stay local.
 
@@ -257,6 +355,9 @@ python3 send_asins.py --csv csv/formatted/asins.csv [options]
 | `--errors-csv PATH` | `<csv name>.errors.csv` | Error summary file. |
 | `--results-key`, `--asin-key`, `--result-key`, `--reason-key` | `results`, `asin`, `result`, `reason` | Response field names. |
 | `--dry-run` | off | Print the first payload; send and save nothing; no credentials needed. |
+| `--watch` | off | Run until stopped; see [Or run it as a service](#4-or-run-it-as-a-service). Not with `--dry-run` or `--no-iterate`. |
+| `--raw-dir PATH` | `csv/raw` next to the script | Raw exports merged by `--watch`. |
+| `--poll-interval SECONDS` | `30` | How often `--watch` checks `--raw-dir` while nothing is pending. |
 
 - Requests run one at a time. After each batch the full CSV is saved atomically, so a stop loses at most the batch in flight.
 - A batch with per-ASIN failures is a normal batch. Only whole-batch failures (HTTP/network errors, unrecognized responses) count toward `--max-consecutive-failures`, which exists to stop marking thousands of rows `UNKNOWN` while the API is down or the credentials are wrong.
@@ -268,7 +369,7 @@ python3 send_asins.py --csv csv/formatted/asins.csv [options]
 | `2` | Error, stop after consecutive failures, interrupted during a request, or at least one `UNKNOWN` outcome. |
 | `130` | Interrupted with Ctrl+C between requests. |
 
-With `--no-iterate`, exit `0` only means that batch succeeded.
+With `--no-iterate`, exit `0` only means that batch succeeded. With `--watch`, only `2` (error) and `130` (stopped) occur.
 
 ### `convert_asins.py`
 
@@ -328,7 +429,7 @@ Keeps the first row of each ASIN (exact match after trimming whitespace; case-se
 | `asins.csv.lock` | Prevents a send, merge or dedupe from overlapping on the same CSV. It may remain after exit; do not delete it while a script runs. |
 | `asins.errors.csv` | One row per failure reason: `error,count,first_seen,last_seen,example_asin`. Counts accumulate across runs (a batch of 50 rejected adds 50); delete the file to reset. |
 
-- **Stop:** Ctrl+C. Finished batches are saved; a batch interrupted mid-request is marked `UNKNOWN`.
+- **Stop:** Ctrl+C or `kill` (SIGTERM). Finished batches are saved; a batch interrupted mid-request is marked `UNKNOWN` (in `--watch` mode it stays pending instead).
 - **Resume:** run the same command again.
 - **Retry a failure:** fix the cause, clear the row's `reason` (keep `sent=false`; for repeated ASINs clear every row), and rerun.
 - **`UNKNOWN` rows:** the API may have accepted them. Resending is safe because the API deduplicates (`duplicate`), so you can clear the reason and rerun. A clear rejection such as HTTP 400 means nothing in that batch was accepted.
@@ -340,13 +441,21 @@ Keeps the first row of each ASIN (exact match after trimming whitespace; case-se
 | --- | --- |
 | `APIENDPOINT and AUTHENDPOINT must be exported` | Export them in the same shell (see [Setup](#setup)). |
 | HTTP 401 / 403 | Wrong endpoint or authorization value; check any required `Bearer ` prefix. |
-| HTTP 503 `No server is available` | The API is down. Do not keep sending: each batch would be marked `UNKNOWN`. Wait, then test with `--no-iterate`. |
+| HTTP 503 `No server is available` | The API is down. Do not keep sending by hand: each batch would be marked `UNKNOWN`. Wait, then test with `--no-iterate`. The service (`--watch`) waits and retries by itself. |
 | HTTP 429 or other 5xx | Use a longer `--interval` or smaller `--batch-size`; clear the `UNKNOWN` reasons and rerun. |
 | `Stopped: N consecutive batches failed` | Check the top of `asins.errors.csv` and the API, fix, clear the `UNKNOWN` reasons, rerun. |
 | Many `invalid` results | Values that are not ASINs; see [Valid ASIN values](#valid-asin-values). |
 | `CSV missing required columns` or `CSV row N: … is required` | Add the column or fix the value on that row (every row, sent or not). |
 | `conflicting priority, defer_variations or scrape_kind` | Make all pending rows of that ASIN match, or run `deduplicate_asins.py`. |
-| `another sender is already using this CSV` / merge refuses to run | Another script holds the lock; wait for it to finish. |
+| `another sender is already using this CSV` / merge refuses to run | Another script holds the lock; wait for it to finish. On the server the service holds it: just drop raw files in `csv/raw/`, or `task stop` first. |
+| `task deploy`: `another process holds … .lock` | A sender started by hand is still running on the server; stop it, then deploy. |
+| `task deploy`: `… asins.csv does not exist yet` | Data not in `remote_dir` yet: `task migrate-data` (current server) or `task init-data` (new server), then `task deploy`. |
+| `task deploy`: `… .env … is missing` | `task migrate-data` creates it from the old setup; otherwise `task upload-env`. |
+| `task init-data`: `the server already has data in …` | Intended: the server's data is ahead of the local copy. Use `task migrate-data`. |
+| `task deploy`: `data files changed during the deploy` | Something wrote the CSV while the service was stopped. The service stays stopped; find the process, then deploy again. |
+| `Permission denied` editing or copying in `csv/` on the server | Intended: the data belongs to `asin-seeder`. See [Data protection](#data-protection). |
+| Log repeats `Batch failed (…); … retry N in …s` | `--watch` is backing off. 503 or network errors: wait for the API. 401/403: fix the local `.env`, then `task upload-env`, then `task stop` and `task start`. A 400 that keeps rejecting the same batch: stop the service and find the bad value in it (`build_payload.py --count 100` shows the batch). |
+| Log shows `Skipped raw file …` | That export is invalid (see [Raw export format](#raw-export-format)); fix it and copy it again. |
 | `Pending: 0` | No row has `sent=false` and an empty `reason`. |
 | Merge says no new raw files | Every file in `csv/raw/` is already in `processed.json`. |
 
@@ -363,5 +472,6 @@ python3 -m unittest -v test_send_asins
 | `test_convert_asins.py` | Adding and re-queuing ASINs, priorities, `scrape_kind`, old-format migration, manifest, invalid input, lock. |
 | `test_build_payload.py` | Selection and order, count limit, unchanged CSV, invalid input. |
 | `test_deduplicate_asins.py` | Keeping the first row, backups, dry run, invalid CSVs, lock. |
+| `test_watch_mode.py` | `--watch`: merging raw files between batches and while idle, settle time, invalid raw files, backoff on outages, per-ASIN failures, clean stop on SIGINT/SIGTERM. |
 
-Tests use temporary files and a mocked or local HTTP server. They never touch `csv/` or `json_payloads/` and never call the real API.
+Tests use temporary files and a mocked or local HTTP server. They never touch `csv/` or `json_payloads/` and never call the real API. The deploy scripts have no automated tests; `bash -n deploy/*.sh` checks their syntax.

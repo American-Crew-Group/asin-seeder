@@ -1,0 +1,31 @@
+# systemd unit for the sender in --watch mode. deploy/server.sh fills in the @...@ values
+# from deploy.prod.yml; see "Deploy to the server" in README.md.
+
+[Unit]
+Description=ASIN seeder (send pending ASINs, merge new raw exports)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@SERVICE_USER@
+Group=@SERVICE_USER@
+WorkingDirectory=@APP_DIR@
+EnvironmentFile=@APP_DIR@/.env
+Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 send_asins.py --csv csv/formatted/asins.csv --watch --batch-size @BATCH_SIZE@ --interval @INTERVAL@
+UMask=0022
+# The service can write only its data, never its own code or the rest of the system.
+ProtectSystem=strict
+ReadWritePaths=@APP_DIR@/csv @APP_DIR@/json_payloads
+PrivateTmp=true
+NoNewPrivileges=true
+# SIGTERM stops it like Ctrl+C: the batch in flight stays pending, exit code 130.
+SuccessExitStatus=130
+TimeoutStopSec=30
+# Exits only on errors that need a person (invalid CSV, missing credentials).
+Restart=on-failure
+RestartSec=10min
+
+[Install]
+WantedBy=multi-user.target

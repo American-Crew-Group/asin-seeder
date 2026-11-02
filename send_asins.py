@@ -8,12 +8,19 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import sys
 import tempfile
 import time
 from datetime import date, datetime
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, build_opener, HTTPRedirectHandler
+
+BASE_DIR = Path(__file__).resolve().parent
+# A raw file modified more recently than this may still be being copied.
+RAW_SETTLE_SECONDS = 10
+# Watch mode waits 1, 2, 4 ... minutes after whole-batch failures, up to an hour.
+BACKOFF_START, BACKOFF_MAX = 60, 3600
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -70,7 +77,17 @@ def arguments():
                         help='priority: lowest priority number first, UPDATE before NEW, then CSV order (default); '
                              'csv: CSV order')
     parser.add_argument('--dry-run', action='store_true', help='print first payload without sending or editing CSV')
-    return parser.parse_args()
+    parser.add_argument('--watch', action='store_true',
+                        help='run until stopped: merge new raw files between batches, wait when nothing is pending, '
+                             'and back off instead of failing rows when the API is unavailable')
+    parser.add_argument('--raw-dir', type=Path, default=BASE_DIR / 'csv' / 'raw',
+                        help='raw exports merged in --watch mode (default: csv/raw next to the script)')
+    parser.add_argument('--poll-interval', type=nonnegative_float, default=30.0,
+                        help='seconds between raw-folder checks while nothing is pending in --watch mode (default: 30)')
+    args = parser.parse_args()
+    if args.watch and (args.dry_run or not args.iterate):
+        parser.error('--watch cannot be combined with --dry-run or --no-iterate')
+    return args
 
 
 def seed_from_row(row, line):
@@ -238,6 +255,79 @@ def parse_results(body, asins, args):
     return indexed, bool(missing)
 
 
+class BatchFailed(Exception):
+    """No per-ASIN outcome could be established for a batch."""
+
+    def __init__(self, problem, reason):
+        super().__init__(problem)
+        self.reason = reason
+
+
+def post_batch(opener, endpoint, authorization, seeds, batch, args):
+    """Send one batch; return (outcomes, incomplete) or raise BatchFailed."""
+    request = Request(endpoint, data=json.dumps(payload([seeds[asin] for asin in batch], args.task_batch_id)).encode(),
+                      headers={'Content-Type': 'application/json', 'Authorization': authorization,
+                               'User-Agent': 'seed-with-priority/1.0'}, method='POST')
+    try:
+        with opener.open(request, timeout=args.timeout) as response:
+            body = response.read()
+        return parse_results(body, batch, args)
+    except HTTPError as error:
+        # A batch-level error does not establish individual outcomes.
+        detail = http_error_detail(error)
+        error.close()
+        problem = f'HTTP {error.code}{f" {detail}" if detail else ""}'
+        raise BatchFailed(problem, f'UNKNOWN: {problem}; verify batch outcome before retrying') from None
+    except (URLError, TimeoutError, OSError, ValueError, KeyError, TypeError) as error:
+        problem = f'request or response could not be confirmed ({type(error).__name__})'
+        raise BatchFailed(problem, f'UNKNOWN: {problem}; verify before retrying') from None
+
+
+def read_csv(path):
+    with path.open(encoding='utf-8-sig', newline='') as file:
+        reader = csv.DictReader(file)
+        fields = reader.fieldnames
+        if not fields or len(fields) != len(set(fields)):
+            raise ValueError('CSV requires unique headers including asin, sent, reason, priority, defer_variations, scrape_kind')
+        missing_fields = {'asin', 'sent', 'reason', 'priority', 'defer_variations', 'scrape_kind'} - set(fields)
+        if missing_fields:
+            raise ValueError(f'CSV missing required columns: {", ".join(sorted(missing_fields))}')
+        return fields, list(reader)
+
+
+def credentials():
+    endpoint, authorization = os.environ.get('APIENDPOINT'), os.environ.get('AUTHENDPOINT')
+    if not endpoint or not authorization:
+        raise ValueError('APIENDPOINT and AUTHENDPOINT must be exported environment variables')
+    if not endpoint.startswith(('http://', 'https://')):
+        raise ValueError('APIENDPOINT must be an HTTP(S) URL')
+    return endpoint, authorization
+
+
+def backup_once(path):
+    """Keep the oldest copy of the CSV; an existing backup is never overwritten."""
+    try:
+        with Path(str(path) + '.bak').open('xb') as target, path.open('rb') as source:
+            shutil.copyfileobj(source, target)
+    except FileExistsError:
+        pass
+
+
+def apply_outcomes(pending, outcomes):
+    for asin, (success, reason) in outcomes.items():
+        for row in pending[asin]:
+            row['sent'] = 'true' if success else 'false'
+            row['reason'] = reason
+
+
+def report_batch(number, batch, outcomes, batch_errors):
+    successful = sum(success for success, _ in outcomes.values())
+    print(f'Batch {number}: {successful} sent, {len(batch) - successful} failed/unknown; CSV saved', flush=True)
+    for reason, count in batch_errors.items():
+        print(f'  {count} x {reason}', file=sys.stderr, flush=True)
+    return len(batch) - successful
+
+
 def run(args):
     path = args.csv.resolve(strict=True)
     # A separate lock remains valid across atomic CSV replacement.
@@ -246,15 +336,9 @@ def run(args):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise ValueError('another sender is already using this CSV') from None
-        with path.open(encoding='utf-8-sig', newline='') as file:
-            reader = csv.DictReader(file)
-            fields = reader.fieldnames
-            if not fields or len(fields) != len(set(fields)):
-                raise ValueError('CSV requires unique headers including asin, sent, reason, priority, defer_variations, scrape_kind')
-            missing_fields = {'asin', 'sent', 'reason', 'priority', 'defer_variations', 'scrape_kind'} - set(fields)
-            if missing_fields:
-                raise ValueError(f'CSV missing required columns: {", ".join(sorted(missing_fields))}')
-            rows = list(reader)
+        if args.watch:
+            return watch(path, args)
+        fields, rows = read_csv(path)
         pending, seeds = pending_seeds(rows)
         asins = send_order(pending, seeds, args.order)
         print(f'Pending: {len(asins)} unique ASINs across {sum(map(len, pending.values()))} rows; order: {args.order}',
@@ -264,19 +348,10 @@ def run(args):
         if args.dry_run:
             print(json.dumps(payload([seeds[asin] for asin in asins[:args.batch_size]], args.task_batch_id), indent=2))
             return 0
-        endpoint, authorization = os.environ.get('APIENDPOINT'), os.environ.get('AUTHENDPOINT')
-        if not endpoint or not authorization:
-            raise ValueError('APIENDPOINT and AUTHENDPOINT must be exported environment variables')
-        if not endpoint.startswith(('http://', 'https://')):
-            raise ValueError('APIENDPOINT must be an HTTP(S) URL')
+        endpoint, authorization = credentials()
         errors_path = args.errors_csv or path.with_name(f'{path.stem}.errors.csv')
         errors = load_errors(errors_path)
-        backup = Path(str(path) + '.bak')
-        try:
-            with backup.open('xb') as target, path.open('rb') as source:
-                shutil.copyfileobj(source, target)
-        except FileExistsError:
-            pass
+        backup_once(path)
         opener = build_opener(NoRedirect)
         last_start = None
         failures = 0
@@ -286,42 +361,22 @@ def run(args):
             batch = asins[offset:offset + args.batch_size]
             if last_start is not None:
                 time.sleep(max(0, args.interval - (time.monotonic() - last_start)))
-            request = Request(endpoint, data=json.dumps(payload([seeds[asin] for asin in batch], args.task_batch_id)).encode(),
-                              headers={'Content-Type': 'application/json', 'Authorization': authorization,
-                                       'User-Agent': 'seed-with-priority/1.0'}, method='POST')
             last_start = time.monotonic()
             incomplete = failed = interrupted = False
             try:
-                with opener.open(request, timeout=args.timeout) as response:
-                    body = response.read()
-                outcomes, incomplete = parse_results(body, batch, args)
-            except HTTPError as error:
-                # A batch-level error does not establish individual outcomes.
-                detail = http_error_detail(error)
-                reason = f'UNKNOWN: HTTP {error.code}{f" {detail}" if detail else ""}; verify batch outcome before retrying'
-                error.close()
-                outcomes = {asin: (False, reason) for asin in batch}
-                failed = True
-            except (URLError, TimeoutError, OSError, ValueError, KeyError, TypeError) as error:
-                reason = f'UNKNOWN: request or response could not be confirmed ({type(error).__name__}); verify before retrying'
-                outcomes = {asin: (False, reason) for asin in batch}
+                outcomes, incomplete = post_batch(opener, endpoint, authorization, seeds, batch, args)
+            except BatchFailed as error:
+                outcomes = {asin: (False, error.reason) for asin in batch}
                 failed = True
             except KeyboardInterrupt:
                 outcomes = {asin: (False, 'UNKNOWN: interrupted during request; verify before retrying') for asin in batch}
                 interrupted = True
-            for asin, (success, reason) in outcomes.items():
-                for row in pending[asin]:
-                    row['sent'] = 'true' if success else 'false'
-                    row['reason'] = reason
+            apply_outcomes(pending, outcomes)
             checkpoint(path, fields, rows)
             batch_errors = record_errors(errors, outcomes)
             if batch_errors:
                 save_errors(errors_path, errors)
-            successful = sum(success for success, _ in outcomes.values())
-            failures += len(batch) - successful
-            print(f'Batch {offset // args.batch_size + 1}: {successful} sent, {len(batch) - successful} failed/unknown; CSV saved', flush=True)
-            for reason, count in batch_errors.items():
-                print(f'  {count} x {reason}', file=sys.stderr)
+            failures += report_batch(offset // args.batch_size + 1, batch, outcomes, batch_errors)
             if interrupted:
                 print('Stopped: interrupted during a request. Review CSV reasons before continuing.', file=sys.stderr)
                 return 2
@@ -338,7 +393,101 @@ def run(args):
         return 2 if unconfirmed else 1 if failures else 0
 
 
+def merge_new_raw(raw_dir, path, digests, rejected):
+    """Merge raw files that appeared since the last check; return True if the CSV changed.
+
+    The caller holds the CSV lock. An invalid raw file is reported once and
+    skipped until its content changes; the other files are still merged.
+    """
+    import convert_asins  # Imported here: convert_asins imports this module.
+    manifest = convert_asins.load_manifest(raw_dir)
+    files = {}
+    for digest, raw in convert_asins.new_raw_files(raw_dir, manifest, digests, RAW_SETTLE_SECONDS).items():
+        if digest in rejected:
+            continue
+        try:
+            files[digest] = (raw, convert_asins.read_raw(raw, 999))
+        except (csv.Error, ValueError) as error:
+            rejected.add(digest)
+            detail = str(error) if str(error).startswith(f'{raw.name}:') else f'{raw.name}: {error}'
+            print(f'Skipped raw file {detail}; fix it and copy it again', file=sys.stderr, flush=True)
+    if not files:
+        return False
+    convert_asins.merge(path, raw_dir / convert_asins.MANIFEST_NAME, manifest, files, defer_variations=False)
+    return True
+
+
+def watch(path, args):
+    """Send pending ASINs until stopped, merging new raw files between batches.
+
+    Unlike a normal run, a whole-batch failure (API down, HTTP error,
+    unrecognized response) leaves the batch pending and retries it after a
+    growing pause, so an outage never marks rows UNKNOWN. Resending is safe:
+    the API answers duplicate for ASINs it already has.
+    """
+    endpoint, authorization = credentials()
+    raw_dir = args.raw_dir.resolve(strict=True)
+    errors_path = args.errors_csv or path.with_name(f'{path.stem}.errors.csv')
+    errors = load_errors(errors_path)
+    backup_once(path)
+    opener = build_opener(NoRedirect)
+    digests, rejected = {}, set()
+    rows = None
+    asins, position = [], 0
+    last_start = None
+    number = outage = 0
+    idle = False
+    print(f'Watching {raw_dir} for new raw files; sending {path.name} in batches of {args.batch_size}', flush=True)
+    while True:
+        if merge_new_raw(raw_dir, path, digests, rejected) or rows is None:
+            fields, rows = read_csv(path)
+            pending, seeds = pending_seeds(rows)
+            asins, position = send_order(pending, seeds, args.order), 0
+            print(f'Pending: {len(asins)} unique ASINs across {sum(map(len, pending.values()))} rows; '
+                  f'order: {args.order}', flush=True)
+        if position >= len(asins):
+            if not idle:
+                print(f'Idle: nothing pending; checking {raw_dir.name}/ every {args.poll_interval:g}s', flush=True)
+                idle = True
+            time.sleep(args.poll_interval)
+            continue
+        idle = False
+        batch = asins[position:position + args.batch_size]
+        if last_start is not None:
+            time.sleep(max(0, args.interval - (time.monotonic() - last_start)))
+        last_start = time.monotonic()
+        try:
+            outcomes, _ = post_batch(opener, endpoint, authorization, seeds, batch, args)
+        except BatchFailed as error:
+            outage += 1
+            delay = min(BACKOFF_START * 2 ** (outage - 1), BACKOFF_MAX)
+            print(f'Batch failed ({error}); its {len(batch)} ASINs stay pending; retry {outage} in {delay}s',
+                  file=sys.stderr, flush=True)
+            time.sleep(delay)
+            continue
+        except KeyboardInterrupt:
+            print('Stopped during a request; its ASINs stay pending and will be sent again.', file=sys.stderr)
+            return 130
+        if outage:
+            print(f'API available again after {outage} failed attempts', flush=True)
+        outage = 0
+        position += len(batch)
+        number += 1
+        apply_outcomes(pending, outcomes)
+        checkpoint(path, fields, rows)
+        batch_errors = record_errors(errors, outcomes)
+        if batch_errors:
+            save_errors(errors_path, errors)
+        report_batch(number, batch, outcomes, batch_errors)
+
+
+def stop_on_sigterm(signum, frame):
+    # Same clean stop as Ctrl+C, so `systemctl stop` or `kill` never cut a save short.
+    raise KeyboardInterrupt
+
+
 if __name__ == '__main__':
+    signal.signal(signal.SIGTERM, stop_on_sigterm)
     try:
         sys.exit(run(arguments()))
     except (OSError, ValueError) as error:

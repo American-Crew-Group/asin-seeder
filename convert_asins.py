@@ -18,6 +18,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 
 from send_asins import checkpoint
 
@@ -119,17 +120,85 @@ def save_manifest(path, manifest):
     os.replace(temporary, path)
 
 
+def load_manifest(raw_dir):
+    path = raw_dir / MANIFEST_NAME
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
+def new_raw_files(raw_dir, manifest, digests=None, min_age=0):
+    """Return {digest: path} for raw files not merged yet, oldest first.
+
+    digests caches hashes by (name, size, mtime) so a long-running caller does
+    not rehash unchanged files. Files modified less than min_age seconds ago
+    are skipped, since they may still be being copied.
+    """
+    now = time.time()
+    found = {}
+    for path in sorted(raw_dir.glob('*.csv'), key=lambda p: (p.stat().st_mtime, p.name)):
+        stat = path.stat()
+        if now - stat.st_mtime < min_age:
+            continue
+        key = (path.name, stat.st_size, stat.st_mtime_ns)
+        if digests is None:
+            digest = sha256(path)
+        else:
+            digest = digests.get(key) or digests.setdefault(key, sha256(path))
+        if digest not in manifest:
+            found.setdefault(digest, path)
+    return found
+
+
+def merge(master, manifest_path, manifest, files, defer_variations, dry_run=False):
+    """Merge parsed raw files {digest: (path, {asin: priority})} into master.
+
+    The caller must hold the master CSV lock. Returns the updated manifest.
+    """
+    rows = read_master(master)
+    defer_variations = 'true' if defer_variations else 'false'
+    entries = {}
+    for digest, (path, asins) in files.items():
+        added = changed = 0
+        for asin, priority in asins.items():
+            row = rows.get(asin)
+            if row is None:
+                rows[asin] = {'asin': asin, 'sent': 'false', 'reason': '',
+                              'priority': str(priority), 'defer_variations': defer_variations,
+                              'scrape_kind': 'NEW'}
+                added += 1
+                continue
+            if row['priority'].strip() != str(priority):
+                row['priority'] = str(priority)
+                changed += 1
+            # A NEW ASIN that was never sent has nothing to update yet.
+            if row['sent'].strip().lower() == 'true':
+                row['scrape_kind'] = 'UPDATE'
+            row['sent'] = 'false'
+            row['reason'] = ''
+        requeued = len(asins) - added
+        entries[digest] = {'file': path.name, 'asins': len(asins), 'added': added,
+                           'requeued': requeued, 'priority_changed': changed,
+                           'processed_at': datetime.now(timezone.utc).isoformat(timespec='seconds')}
+        print(f'{path.name}: {len(asins)} ASINs; {added} added, {requeued} queued again '
+              f'({changed} with new priority)', flush=True)
+    if dry_run:
+        print(f'Dry run: would save {len(rows)} rows to {master}; nothing written')
+        return manifest
+    if not master.exists():
+        master.touch()
+    checkpoint(master, FIELDS, rows.values())
+    # Recorded only after the CSV is saved, so a failed merge is retried.
+    manifest = {**manifest, **entries}
+    save_manifest(manifest_path, manifest)
+    print(f'Saved {len(rows)} rows to {master}; recorded {len(entries)} files in {manifest_path.name}', flush=True)
+    return manifest
+
+
 def run(args):
     raw_dir = args.raw_dir.resolve(strict=True)
     master = args.master.resolve()
-    manifest_path = raw_dir / MANIFEST_NAME
-    manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
+    manifest = load_manifest(raw_dir)
     # Oldest first, so the newest request sets an ASIN's priority.
-    pending = {}
-    for path in sorted(raw_dir.glob('*.csv'), key=lambda p: (p.stat().st_mtime, p.name)):
-        digest = sha256(path)
-        if digest not in manifest:
-            pending.setdefault(digest, path)
+    pending = new_raw_files(raw_dir, manifest)
     if not pending and not is_legacy(master):
         print(f'No new raw files in {raw_dir}; {master.name} unchanged')
         return 0
@@ -140,43 +209,9 @@ def run(args):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise ValueError('another process is already using the master CSV') from None
-        rows = read_master(master)
-        defer_variations = 'true' if args.defer_variations else 'false'
-        entries = {}
-        for digest, path in pending.items():
-            asins = read_raw(path, args.default_priority)
-            added = changed = 0
-            for asin, priority in asins.items():
-                row = rows.get(asin)
-                if row is None:
-                    rows[asin] = {'asin': asin, 'sent': 'false', 'reason': '',
-                                  'priority': str(priority), 'defer_variations': defer_variations,
-                                  'scrape_kind': 'NEW'}
-                    added += 1
-                    continue
-                if row['priority'].strip() != str(priority):
-                    row['priority'] = str(priority)
-                    changed += 1
-                # A NEW ASIN that was never sent has nothing to update yet.
-                if row['sent'].strip().lower() == 'true':
-                    row['scrape_kind'] = 'UPDATE'
-                row['sent'] = 'false'
-                row['reason'] = ''
-            requeued = len(asins) - added
-            entries[digest] = {'file': path.name, 'asins': len(asins), 'added': added,
-                               'requeued': requeued, 'priority_changed': changed,
-                               'processed_at': datetime.now(timezone.utc).isoformat(timespec='seconds')}
-            print(f'{path.name}: {len(asins)} ASINs; {added} added, {requeued} queued again '
-                  f'({changed} with new priority)')
-        if args.dry_run:
-            print(f'Dry run: would save {len(rows)} rows to {master}; nothing written')
-            return 0
-        if not master.exists():
-            master.touch()
-        checkpoint(master, FIELDS, rows.values())
-        # Recorded only after the CSV is saved, so a failed merge is retried.
-        save_manifest(manifest_path, {**manifest, **entries})
-        print(f'Saved {len(rows)} rows to {master}; recorded {len(entries)} files in {manifest_path.name}')
+        # Any invalid raw file rejects the whole merge before the master is read.
+        files = {digest: (path, read_raw(path, args.default_priority)) for digest, path in pending.items()}
+        merge(master, raw_dir / MANIFEST_NAME, manifest, files, args.defer_variations, args.dry_run)
         return 0
 
 

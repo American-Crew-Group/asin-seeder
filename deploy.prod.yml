@@ -1,0 +1,19 @@
+# Production server for the ASIN seeder service; read by deploy/prod.sh (task deploy, status, stop ...).
+# Flat "key: value" lines only.
+
+host: 172.20.22.232
+ssh_user: ubuntu
+ssh_port: 22
+ssh_key: ~/.ssh/pem/KP-MNM-Ubuntu.pem
+
+# Code is installed here (owned by root). Data lives in csv/ below it and is owned by service_user.
+remote_dir: /opt/asin-seeder
+service_name: asin-seeder
+service_user: asin-seeder
+batch_size: 100
+# Minimum seconds between requests (the manual runs used 5-10).
+interval: 5
+
+# Where the data lived before the service; used once by task migrate-data, and init-data refuses
+# to upload local data while an asins.csv exists there.
+migrate_from: /home/ubuntu/asin-seeder
