@@ -9,7 +9,7 @@ Merge raw ASIN exports into one CSV and submit its pending ASINs to the seeding 
 | `build_payload.py` | Write the next request body to `json_payloads/` without sending it. |
 | `deduplicate_asins.py` | Remove duplicate ASIN rows from a CSV. |
 
-In production the sender runs as a systemd service that merges new raw exports and sends by itself; see [Production server](#production-server). `Taskfile.yml`, `deploy.prod.yml` and `deploy/` deploy and operate it.
+In production the sender runs as a systemd service on the server, which holds the only authoritative `asins.csv`; new exports are copied there and merged and sent by the service itself (see [Workflow](#workflow)). `Taskfile.yml`, `deploy.prod.yml` and `deploy/` deploy and operate it.
 
 ```text
 raw export ──► csv/raw/ ──convert_asins.py──► csv/formatted/asins.csv ──send_asins.py──► seeding API
@@ -19,69 +19,65 @@ raw export ──► csv/raw/ ──convert_asins.py──► csv/formatted/asin
 
 ## Workflow
 
-First time? Do the [Setup](#setup) below. These steps run the scripts by hand; on the production server the service does steps 1 and 3 by itself.
+**Load ASINs only on the production server, never locally.** The server's `csv/formatted/asins.csv` is the source of truth: it records what was sent. A local copy is behind it, so merging or sending from it would send ASINs again or skip them, and its results would never reach the server. Do not run `convert_asins.py` or `send_asins.py` on local data for production.
 
-### 1. Load new ASINs
+### 1. Copy the export to the server
+
+Copy it into `csv/raw/` under another extension, then rename it, so the service never reads a half-copied file. Only `*.csv` files are read; give each export a new name (for example with the date) so the folder keeps the history:
 
 ```bash
-cp ~/Downloads/new_export.csv csv/raw/    # see Raw export format below
-python3 convert_asins.py --dry-run        # shows added / queued again per file; writes nothing
-python3 convert_asins.py                  # merges into csv/formatted/asins.csv
+scp -i ~/.ssh/pem/KP-MNM-Ubuntu.pem new.csv ubuntu@172.20.22.232:/opt/asin-seeder/csv/raw/2026-11-02-new.csv.part
+ssh -i ~/.ssh/pem/KP-MNM-Ubuntu.pem ubuntu@172.20.22.232 \
+  mv /opt/asin-seeder/csv/raw/2026-11-02-new.csv.part /opt/asin-seeder/csv/raw/2026-11-02-new.csv
 ```
 
-Under the hood, `convert_asins.py`:
+The file must follow the [Raw export format](#raw-export-format). `rsync` already writes to a temporary name, so it needs no rename. The SSH user can write to `csv/raw/` because it is in the `asin-seeder` group (log in again after the first deploy).
+
+### 2. Nothing else: the running service merges it
+
+No restart, deploy or command is needed. Once the file is 10 seconds old, the service merges it before its next batch, or within 30 seconds when nothing is pending, and re-sorts the queue, so a priority 1 ASIN goes out within one batch. Merging:
 
 1. Picks the files in `csv/raw/` whose content hash is not yet in `csv/raw/processed.json`, oldest first.
 2. Reads each file's `asin` and `priority` (999 when missing).
 3. Adds ASINs not in the CSV as pending: `sent=false`, `scrape_kind=NEW`, `defer_variations=false`.
 4. Queues ASINs already in the CSV again: `sent=false`, `reason` cleared, the file's priority, and `scrape_kind=UPDATE` if they had been sent before.
-5. Saves the CSV atomically, then records the files in `processed.json` so they are never merged twice.
+5. Saves the CSV atomically, then records the files in `processed.json` so they are never merged twice. Copying the same content again, under any name, does nothing.
 
-It does not check that values are real ASINs, so review them next.
+It does not check that values are real ASINs; the API answers `invalid` for those and the row gets that `reason`.
 
-### 2. Check the data
-
-```bash
-python3 send_asins.py --csv csv/formatted/asins.csv --batch-size 50 --dry-run
-```
-
-The dry run validates the whole CSV, prints how many ASINs are pending and shows the first batch. Exclude values that are not ASINs (SKUs, barcodes, Excel scientific notation, …) by giving them a `reason`; see [Valid ASIN values](#valid-asin-values).
-
-### 3. Send
+### 3. Check the result
 
 ```bash
-set -a; source .env; set +a             # load credentials into this shell
-python3 send_asins.py --csv csv/formatted/asins.csv --batch-size 50 --no-iterate   # one batch to test
-python3 send_asins.py --csv csv/formatted/asins.csv --batch-size 50                # everything
+task status    # pending / sent / failed counts, top errors, last log lines
+task logs      # follow the log: "<file>.csv: N ASINs; X added, Y queued again", then the batches
 ```
 
-Under the hood, `send_asins.py`:
+An invalid file (empty ASIN, non-integer priority, malformed row) is skipped as a whole and logged as `Skipped raw file <name>: …; fix it and copy it again`; the other files are still merged. Fix it locally and copy it again as in step 1.
 
-1. Locks the CSV and validates every row.
-2. Selects pending rows (`sent=false`, empty `reason`), one per unique ASIN, and orders them: priority 1 `UPDATE`, priority 1 `NEW`, then the same for each following priority (see [Sending order](#sending-order)).
-3. Copies the CSV to `asins.csv.bak` the first time (never overwritten).
-4. For each batch: sends one `POST`, reads the result of every ASIN, marks successes `sent=true` and failures with a `reason`, saves the CSV atomically and adds failures to `asins.errors.csv`.
-5. Ends when nothing is pending, on Ctrl+C, or after 5 batches in a row fail as a whole (API down, bad credentials).
+### How the service sends
 
-Rerun the same command to resume: only rows still pending are sent, most important first. To retry a failed row, fix the cause, clear its `reason` and rerun.
+The service runs `send_asins.py --watch` (see [Production server](#production-server)). For each batch it:
 
-### 4. Or run it as a service
+1. Selects pending rows (`sent=false`, empty `reason`), one per unique ASIN, ordered priority 1 `UPDATE`, priority 1 `NEW`, then the same for each following priority (see [Sending order](#sending-order)).
+2. Sends one `POST`, reads the result of every ASIN, marks successes `sent=true` and failures with a `reason`, saves the CSV atomically and adds failures to `asins.errors.csv`.
 
-On a server, `--watch` keeps the sender running instead of exiting:
+- **API outages do not fail rows.** A whole-batch failure (HTTP error, network error, timeout, unrecognized response) leaves the batch pending and retries it after 1, 2, 4 … minutes, up to 1 hour.
+- **Stopping** (`task stop`, `systemctl stop`) never marks rows `UNKNOWN`: a batch in flight stays pending and is sent again; the API answers `duplicate` if it had already arrived.
+- It exits only when stopped (`130`) or on errors a person must fix (`2`: invalid `asins.csv`, missing credentials); systemd then restarts it every 10 minutes.
+
+### Running the scripts by hand
+
+Only for testing or a copy that is not production data. While the service runs, `convert_asins.py` and a second `send_asins.py` on the server refuse to start because the service holds the CSV lock.
 
 ```bash
-python3 send_asins.py --csv csv/formatted/asins.csv --watch --batch-size 100
+python3 convert_asins.py --dry-run                                             # what csv/raw/ would add; writes nothing
+python3 send_asins.py --csv csv/formatted/asins.csv --batch-size 50 --dry-run  # validate the CSV, show the first batch
+set -a; source .env; set +a
+python3 send_asins.py --csv csv/formatted/asins.csv --batch-size 50 --no-iterate   # one batch
+python3 send_asins.py --csv csv/formatted/asins.csv --watch --batch-size 100       # service mode
 ```
 
-- **New raw files are merged automatically.** Between batches, and every `--poll-interval` seconds (30) while nothing is pending, it merges new files in `csv/raw/` exactly like `convert_asins.py` and recomputes the order, so a priority 1 ASIN goes out within one batch. Do not run `convert_asins.py` yourself meanwhile; it would refuse because the sender holds the lock.
-- **Files still being copied are skipped:** a file modified in the last 10 seconds waits for the next check.
-- **An invalid raw file is skipped,** reported once in the log, and never recorded in `processed.json`; the other files are still merged. Fix it and copy it again.
-- **API outages do not fail rows.** A whole-batch failure (HTTP error, network error, timeout, unrecognized response) leaves the batch pending and retries it after 1, 2, 4 … minutes, up to 1 hour, so a long outage costs nothing to clean up. Per-ASIN results such as `invalid` are recorded as usual. `--max-consecutive-failures` does not apply.
-- **Stopping** (Ctrl+C, `kill`, `systemctl stop`) never marks rows `UNKNOWN`: a batch in flight stays pending and is sent again; the API answers `duplicate` if it had already arrived.
-- New ASINs get priority 999 when the file has none and `defer_variations=false`, as with `convert_asins.py`'s defaults.
-- It never exits on its own: exit `130` after a stop, `2` on errors a person must fix (invalid `asins.csv`, missing credentials).
-
-To run it on the production server, use the deploy tasks below rather than starting it by hand.
+Without `--watch`, `send_asins.py` exits when nothing is pending, on Ctrl+C, or after 5 whole-batch failures in a row; rerun it to resume.
 
 ## Production server
 
@@ -139,15 +135,7 @@ The server's data is the source of truth: `csv/formatted/asins.csv` (with its `.
 
 ### Loading new ASINs
 
-Copy the export into `csv/raw/` on the server; once it is 10 seconds old, the service merges it before its next batch, or within 30 seconds when nothing is pending. The SSH user can write there because it is in the `asin-seeder` group (log in again after the first deploy). Copy under another extension and rename it, so a half-copied file is never read:
-
-```bash
-scp -i ~/.ssh/pem/KP-MNM-Ubuntu.pem new.csv ubuntu@172.20.22.232:/opt/asin-seeder/csv/raw/new.csv.part
-ssh -i ~/.ssh/pem/KP-MNM-Ubuntu.pem ubuntu@172.20.22.232 \
-  mv /opt/asin-seeder/csv/raw/new.csv.part /opt/asin-seeder/csv/raw/new.csv
-```
-
-`rsync` already writes to a temporary name. Check the result with `task status` or `task logs`.
+Copy the export to the server with `scp`; the service merges it by itself. See [Workflow](#workflow).
 
 ### On the server
 
@@ -206,7 +194,7 @@ Run commands from the project folder. `--csv` paths are relative to the current 
 
 ## Raw export format
 
-Files dropped in `csv/raw/` for `convert_asins.py`:
+Files copied to `csv/raw/` on the server (see [Workflow](#workflow)):
 
 ```csv
 asin,priority
