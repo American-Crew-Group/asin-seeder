@@ -233,8 +233,14 @@ PY
     printf 'CSV:       %s missing\n' "$CSV"
   fi
   if [[ -f $APP_DIR/csv/formatted/asins.errors.csv ]]; then
-    echo 'Top errors:'
-    head -n 6 "$APP_DIR/csv/formatted/asins.errors.csv" | tail -n +2 | cut -d, -f1-2 | sed 's/^/    /'
+    echo 'Top errors (count, last seen, reason):'
+    python3 - "$APP_DIR/csv/formatted/asins.errors.csv" <<'PY'
+import csv, sys
+with open(sys.argv[1], encoding='utf-8-sig', newline='') as file:
+    for row in list(csv.DictReader(file))[:5]:
+        reason = ' '.join(row['error'].split())
+        print(f"    {int(row['count']):>8,}  {row['last_seen'][:10]}  {reason[:110]}{'…' if len(reason) > 110 else ''}")
+PY
   fi
   echo 'Last log lines:'
   journalctl -u "$SERVICE" -n 15 --no-pager -o short-iso 2>/dev/null | sed 's/^/    /' || true
